@@ -1,4 +1,4 @@
-# DDD — Doomsday Detector
+# DDD - Doomsday Detector
 
 Консольная проверка `javaw.exe` под Doomsday. Windows, запуск от имени администратора.
 
