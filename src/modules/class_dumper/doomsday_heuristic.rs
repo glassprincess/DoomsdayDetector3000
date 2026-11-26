@@ -10,13 +10,19 @@ fn is_blatant(local: &str) -> bool {
     if !(6..=16).contains(&len) {
         return false;
     }
-    if !local.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return false;
     }
     if !local.chars().any(|c| c.is_ascii_digit()) {
         return false;
     }
-    let vowels = local.chars().filter(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u')).count();
+    let vowels = local
+        .chars()
+        .filter(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+        .count();
     (vowels as f64) / (len as f64) < 0.30
 }
 
@@ -29,7 +35,9 @@ fn is_blatant(local: &str) -> bool {
 /// цифрами и смешанным регистром, вида `KUOWYickmwqy1$5ACMGOq1eyBiA7Alq`.
 /// Дескрипторы массива `[L...;` (в т.ч. вложенные `[[L...;`) снимаем заранее.
 fn is_normal(stripped: &str) -> bool {
-    let Some(slash) = stripped.rfind('/') else { return false };
+    let Some(slash) = stripped.rfind('/') else {
+        return false;
+    };
     let prefix = &stripped[..slash];
     let local = &stripped[slash + 1..];
 
@@ -51,7 +59,10 @@ fn is_normal(stripped: &str) -> bool {
     if local.chars().count() < 10 {
         return false;
     }
-    if !local.chars().all(|c| c.is_ascii_alphanumeric() || c == '$' || c == '_') {
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '$' || c == '_')
+    {
         return false;
     }
     if !local.chars().any(|c| c.is_ascii_digit()) {
@@ -125,7 +136,7 @@ pub struct DoomsdayFindings {
 
 impl DoomsdayFindings {
     pub fn vanilla_flagged(&self) -> bool {
-        if self.vanilla_window == 0 {
+        if self.vanilla_window < VANILLA_ABS_THRESHOLD {
             return false;
         }
         self.vanilla_total_in_window >= VANILLA_ABS_THRESHOLD
@@ -166,12 +177,40 @@ pub fn scan(classes: &[String]) -> DoomsdayFindings {
         }
     }
 
-    DoomsdayFindings { blatant, normal, vanilla_window: window, vanilla_total_in_window: vanilla_total, vanilla_sample }
+    DoomsdayFindings {
+        blatant,
+        normal,
+        vanilla_window: window,
+        vanilla_total_in_window: vanilla_total,
+        vanilla_sample,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_vanilla_window_is_not_flagged() {
+        let mut classes = vec!["abc".to_string()];
+        classes.extend((0..9).map(|i| format!("java/lang/Example{i}")));
+        let findings = scan(&classes);
+        assert_eq!(findings.vanilla_window, 1);
+        assert!(!findings.vanilla_flagged());
+    }
+
+    #[test]
+    fn vanilla_density_requires_a_sufficient_window() {
+        let mut classes: Vec<_> = (0..250).map(|i| format!("java/lang/Example{i}")).collect();
+        for name in classes.iter_mut().take(5) {
+            *name = "abc".into();
+        }
+        let findings = scan(&classes);
+        assert_eq!(findings.vanilla_window, 25);
+        assert!(findings.vanilla_flagged());
+        classes[4] = "java/lang/String".into();
+        assert!(!scan(&classes).vanilla_flagged());
+    }
 
     #[test]
     fn blatant_examples_are_detected() {
@@ -208,8 +247,14 @@ mod tests {
 
     #[test]
     fn vanilla_short_examples_match_the_shape() {
-        for name in ["bdj$a", "bbo$a", "bav$a", "bac$a", "zxp", "zxk", "zxo", "zxv", "zxs", "zwt", "zws", "beb$a", "bea$a", "zxg"] {
-            assert!(looks_vanilla_short(name), "expected vanilla-shape hit for {name}");
+        for name in [
+            "bdj$a", "bbo$a", "bav$a", "bac$a", "zxp", "zxk", "zxo", "zxv", "zxs", "zwt", "zws",
+            "beb$a", "bea$a", "zxg",
+        ] {
+            assert!(
+                looks_vanilla_short(name),
+                "expected vanilla-shape hit for {name}"
+            );
         }
     }
 
@@ -247,6 +292,10 @@ mod tests {
             "1wk54cybae",
         ];
         let findings = scan(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert!(findings.blatant.len() >= 2, "expected blatant hits, got {:?}", findings.blatant);
+        assert!(
+            findings.blatant.len() >= 2,
+            "expected blatant hits, got {:?}",
+            findings.blatant
+        );
     }
 }

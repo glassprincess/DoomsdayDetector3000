@@ -312,8 +312,18 @@ pub fn render_scan_result(result: &ProcessDetection) {
         result.regions_scanned,
         human_bytes(result.bytes_scanned)
     );
+    if !result.is_complete() {
+        warn(&format!(
+            "INCOMPLETE: skipped {} in {} regions. A clean result cannot be established.",
+            human_bytes(result.bytes_skipped), result.regions_incomplete
+        ));
+    }
     if result.matches.is_empty() {
-        success("●  CLEAN — no known signatures found");
+        if result.is_complete() {
+            success("●  CLEAN — no known signatures found in scanned memory");
+        } else {
+            warn("No signatures found in the readable portion of memory.");
+        }
         return;
     }
     if result.has_confirmed() {

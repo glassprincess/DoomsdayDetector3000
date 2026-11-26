@@ -244,7 +244,7 @@ impl ProcessHandle {
     /// количество (может быть меньше при частичном чтении на границе региона).
     pub fn read_memory(&self, addr: usize, buf: &mut [u8]) -> usize {
         let mut read = 0usize;
-        let ok = unsafe {
+        unsafe {
             ReadProcessMemory(
                 self.0,
                 addr,
@@ -253,11 +253,8 @@ impl ProcessHandle {
                 &mut read,
             )
         };
-        if ok == 0 {
-            0
-        } else {
-            read
-        }
+        // ERROR_PARTIAL_COPY can still supply a readable prefix.
+        read.min(buf.len())
     }
 
     /// Резолвит путь к файлу, на который отображена память по данному адресу
@@ -408,7 +405,7 @@ pub struct RegionWalker<'a> {
 }
 
 impl<'a> Iterator for RegionWalker<'a> {
-    type Item = MemoryBasicInformation;
+    type Item = io::Result<MemoryBasicInformation>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -423,9 +420,15 @@ impl<'a> Iterator for RegionWalker<'a> {
                 std::mem::size_of::<MemoryBasicInformation>(),
             )
         };
-        if written == 0 || mbi.region_size == 0 {
+        if written == 0 {
             self.done = true;
-            return None;
+            let error = last_error();
+            // VirtualQueryEx returns ERROR_INVALID_PARAMETER past the address space.
+            return if error.raw_os_error() == Some(87) { None } else { Some(Err(error)) };
+        }
+        if mbi.region_size == 0 {
+            self.done = true;
+            return Some(Err(io::Error::other("VirtualQueryEx returned an empty region")));
         }
         let next = mbi.base_address.wrapping_add(mbi.region_size);
         if next <= self.addr {
@@ -433,7 +436,7 @@ impl<'a> Iterator for RegionWalker<'a> {
         } else {
             self.addr = next;
         }
-        Some(mbi)
+        Some(Ok(mbi))
     }
 }
 

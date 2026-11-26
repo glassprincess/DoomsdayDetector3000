@@ -5,6 +5,7 @@
 //! ClassLoaderDataGraph → ClassLoaderData → Klass и достаём имена классов.
 
 use crate::win::ProcessHandle;
+use std::collections::HashSet;
 
 const VM_STRUCT_COUNT: usize = 788;
 
@@ -13,6 +14,134 @@ struct StructEntry {
     field_name: String,
     offset: u64,
     address: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestGraph {
+        ctx: JvmContext,
+        _symbol: Box<[u8; 32]>,
+        klass: Box<[usize; 2]>,
+        loader: Box<[usize; 2]>,
+        _head: Box<usize>,
+    }
+
+    fn graph() -> TestGraph {
+        let mut symbol = Box::new([0u8; 32]);
+        let name = b"java/lang/String";
+        symbol[4..6].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        symbol[6..6 + name.len()].copy_from_slice(name);
+        let klass = Box::new([symbol.as_ptr() as usize, 0]);
+        let loader = Box::new([klass.as_ptr() as usize, 0]);
+        let head = Box::new(loader.as_ptr() as usize);
+        let mut ctx = JvmContext::open(std::process::id()).unwrap();
+        for (type_name, field_name, offset, address) in [
+            (
+                "ClassLoaderDataGraph",
+                "_head",
+                0,
+                (&*head as *const usize) as usize,
+            ),
+            ("ClassLoaderData", "_klasses", 0, 0),
+            ("ClassLoaderData", "_next", 8, 0),
+            ("Klass", "_next_link", 8, 0),
+            ("Klass", "_name", 0, 0),
+            ("Symbol", "_length", 4, 0),
+            ("Symbol", "_body", 6, 0),
+        ] {
+            ctx.structs.push(StructEntry {
+                type_name: type_name.into(),
+                field_name: field_name.into(),
+                offset,
+                address,
+            });
+        }
+        TestGraph {
+            ctx,
+            _symbol: symbol,
+            klass,
+            loader,
+            _head: head,
+        }
+    }
+
+    #[test]
+    fn enumerates_with_zero_offsets_without_compressed_oops_fields() {
+        let graph = graph();
+        assert_eq!(
+            graph.ctx.enumerate_all_class_names().unwrap(),
+            ["java/lang/String"]
+        );
+    }
+
+    #[test]
+    fn missing_required_field_is_an_error() {
+        let mut graph = graph();
+        graph
+            .ctx
+            .structs
+            .retain(|entry| entry.field_name != "_next_link");
+        assert!(graph.ctx.enumerate_all_class_names().is_err());
+    }
+
+    #[test]
+    fn cyclic_class_list_is_an_error() {
+        let mut graph = graph();
+        graph.klass[1] = graph.klass.as_ptr() as usize;
+        assert!(graph
+            .ctx
+            .enumerate_all_class_names()
+            .unwrap_err()
+            .contains("Cycle"));
+    }
+
+    #[test]
+    fn cyclic_loader_list_is_an_error() {
+        let mut graph = graph();
+        graph.loader[1] = graph.loader.as_ptr() as usize;
+        assert!(graph
+            .ctx
+            .enumerate_all_class_names()
+            .unwrap_err()
+            .contains("Cycle"));
+    }
+
+    #[test]
+    fn unreadable_pointer_does_not_return_partial_success() {
+        let mut graph = graph();
+        graph.klass[1] = 1;
+        assert!(graph.ctx.enumerate_all_class_names().is_err());
+    }
+
+    #[test]
+    fn symbol_layout_comes_from_vm_structs() {
+        let mut graph = graph();
+        let name = b"java/lang/String";
+        graph._symbol.fill(0);
+        graph._symbol[..2].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        graph._symbol[8..8 + name.len()].copy_from_slice(name);
+        for entry in &mut graph.ctx.structs {
+            if entry.type_name == "Symbol" {
+                entry.offset = if entry.field_name == "_length" { 0 } else { 8 };
+            }
+        }
+        assert_eq!(
+            graph.ctx.enumerate_all_class_names().unwrap(),
+            ["java/lang/String"]
+        );
+    }
+
+    #[test]
+    fn missing_symbol_layout_is_an_error() {
+        let mut graph = graph();
+        graph
+            .ctx
+            .structs
+            .retain(|entry| entry.type_name != "Symbol");
+        assert!(graph.ctx.enumerate_all_class_names().is_err());
+    }
 }
 
 #[repr(C)]
@@ -122,9 +251,6 @@ struct ExportEntry {
 pub struct JvmContext {
     handle: ProcessHandle,
     jvm_base: usize,
-    narrow_oop_base: u64,
-    narrow_oop_shift: i32,
-    use_compressed_oops: bool,
     structs: Vec<StructEntry>,
 }
 
@@ -140,9 +266,6 @@ impl JvmContext {
         Ok(Self {
             handle,
             jvm_base: 0,
-            narrow_oop_base: 0,
-            narrow_oop_shift: 0,
-            use_compressed_oops: false,
             structs: Vec::new(),
         })
     }
@@ -152,24 +275,12 @@ impl JvmContext {
             Some(b) => b,
             None => return false,
         };
-        self.parse_vm_struct_table() && self.read_compressed_oops_info()
+        self.structs.clear();
+        self.parse_vm_struct_table()
     }
 
     fn read_bytes(&self, addr: usize, buf: &mut [u8]) -> bool {
         addr != 0 && self.handle.read_memory(addr, buf) == buf.len()
-    }
-
-    fn read_u16(&self, addr: usize) -> u16 {
-        let mut b = [0u8; 2];
-        self.read_bytes(addr, &mut b);
-        u16::from_le_bytes(b)
-    }
-
-    #[allow(dead_code)]
-    fn read_u32(&self, addr: usize) -> u32 {
-        let mut b = [0u8; 4];
-        self.read_bytes(addr, &mut b);
-        u32::from_le_bytes(b)
     }
 
     fn read_u64(&self, addr: usize) -> u64 {
@@ -219,7 +330,12 @@ impl JvmContext {
             if type_name.is_empty() || field_name.is_empty() {
                 break;
             }
-            self.structs.push(StructEntry { type_name, field_name, offset: raw.offset, address: raw.address });
+            self.structs.push(StructEntry {
+                type_name,
+                field_name,
+                offset: raw.offset,
+                address: raw.address,
+            });
         }
         !self.structs.is_empty()
     }
@@ -253,7 +369,10 @@ impl JvmContext {
         }
 
         let mut export_buf = vec![0u8; std::mem::size_of::<ImageExportDirectory>()];
-        if !self.read_bytes(self.jvm_base + export_dir_entry.virtual_address as usize, &mut export_buf) {
+        if !self.read_bytes(
+            self.jvm_base + export_dir_entry.virtual_address as usize,
+            &mut export_buf,
+        ) {
             return result;
         }
         let export_dir: ImageExportDirectory = unsafe { read_struct(&export_buf) };
@@ -266,21 +385,29 @@ impl JvmContext {
         let mut names_buf = vec![0u8; export_dir.number_of_names as usize * 4];
         let mut ordinals_buf = vec![0u8; export_dir.number_of_names as usize * 2];
         let mut functions_buf = vec![0u8; export_dir.number_of_functions as usize * 4];
-        if !self.read_bytes(self.jvm_base + export_dir.address_of_names as usize, &mut names_buf)
-            || !self.read_bytes(self.jvm_base + export_dir.address_of_name_ordinals as usize, &mut ordinals_buf)
-            || !self.read_bytes(self.jvm_base + export_dir.address_of_functions as usize, &mut functions_buf)
-        {
+        if !self.read_bytes(
+            self.jvm_base + export_dir.address_of_names as usize,
+            &mut names_buf,
+        ) || !self.read_bytes(
+            self.jvm_base + export_dir.address_of_name_ordinals as usize,
+            &mut ordinals_buf,
+        ) || !self.read_bytes(
+            self.jvm_base + export_dir.address_of_functions as usize,
+            &mut functions_buf,
+        ) {
             return result;
         }
 
         for i in 0..export_dir.number_of_names as usize {
             let name_rva = u32::from_le_bytes(names_buf[i * 4..i * 4 + 4].try_into().unwrap());
-            let ordinal = u16::from_le_bytes(ordinals_buf[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+            let ordinal =
+                u16::from_le_bytes(ordinals_buf[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
             let func_off = ordinal * 4;
             if func_off + 4 > functions_buf.len() {
                 continue;
             }
-            let address = u32::from_le_bytes(functions_buf[func_off..func_off + 4].try_into().unwrap());
+            let address =
+                u32::from_le_bytes(functions_buf[func_off..func_off + 4].try_into().unwrap());
             let name = self.read_string(self.jvm_base + name_rva as usize, 200);
             if !name.is_empty() {
                 result.push(ExportEntry { name, address });
@@ -289,90 +416,89 @@ impl JvmContext {
         result
     }
 
-    fn read_compressed_oops_info(&mut self) -> bool {
-        let base = self.find_struct("CompressedOops", "_narrow_oop._base").map(|s| s.address);
-        let shift = self.find_struct("CompressedOops", "_narrow_oop._shift").map(|s| s.address);
-        let use_flag = self.find_struct("CompressedOops", "_narrow_oop._use_implicit_null_checks").map(|s| s.address);
-        let (Some(base_addr), Some(shift_addr), Some(use_addr)) = (base, shift, use_flag) else {
-            return false;
-        };
-
-        let mut base_buf = [0u8; 8];
-        if !self.read_bytes(base_addr, &mut base_buf) {
-            return false;
-        }
-        let mut shift_buf = [0u8; 4];
-        if !self.read_bytes(shift_addr, &mut shift_buf) {
-            return false;
-        }
-        let mut use_buf = [0u8; 1];
-        self.read_bytes(use_addr, &mut use_buf);
-
-        self.narrow_oop_base = u64::from_le_bytes(base_buf);
-        self.narrow_oop_shift = i32::from_le_bytes(shift_buf);
-        self.use_compressed_oops = use_buf[0] != 0;
-        true
-    }
-
     fn find_struct(&self, type_name: &str, field_name: &str) -> Option<&StructEntry> {
-        self.structs.iter().find(|s| s.type_name == type_name && s.field_name == field_name)
+        self.structs
+            .iter()
+            .find(|s| s.type_name == type_name && s.field_name == field_name)
     }
 
-    fn get_struct_offset(&self, type_name: &str, field_name: &str) -> usize {
-        self.find_struct(type_name, field_name).map(|s| s.offset as usize).unwrap_or(0)
+    fn required_struct(&self, type_name: &str, field_name: &str) -> Result<&StructEntry, String> {
+        self.find_struct(type_name, field_name)
+            .ok_or_else(|| format!("JVM field unavailable: {type_name}::{field_name}"))
     }
 
-    pub fn read_pointer_raw(&self, addr: usize) -> usize {
-        self.read_ptr(addr)
+    fn read_pointer_at(&self, base: usize, offset: usize) -> Result<usize, String> {
+        let addr = base.checked_add(offset).ok_or("JVM address overflow")?;
+        let mut bytes = [0u8; 8];
+        if !self.read_bytes(addr, &mut bytes) {
+            return Err(format!(
+                "Could not read JVM pointer at 0x{addr:X}; class scan incomplete."
+            ));
+        }
+        Ok(u64::from_le_bytes(bytes) as usize)
     }
 
     /// Обходит ClassLoaderDataGraph → ClassLoaderData → Klass и собирает имена
     /// всех загруженных классов — то, ради чего вообще нужен весь этот разбор
     /// PE/VMStructs выше.
-    pub fn enumerate_all_class_names(&self) -> Vec<String> {
+    pub fn enumerate_all_class_names(&self) -> Result<Vec<String>, String> {
         let mut result = Vec::new();
-        let Some(head) = self.find_struct("ClassLoaderDataGraph", "_head") else {
-            return result;
-        };
-        let mut cld = self.read_pointer_raw(head.address);
-        if cld == 0 {
-            return result;
-        }
+        let head = self.required_struct("ClassLoaderDataGraph", "_head")?;
+        let mut cld = self.read_pointer_at(head.address, 0)?;
 
-        let klasses_offset = self.get_struct_offset("ClassLoaderData", "_klasses");
-        let next_link_offset = self.get_struct_offset("Klass", "_next_link");
-        let next_offset = self.get_struct_offset("ClassLoaderData", "_next");
+        let klasses_offset = self.required_struct("ClassLoaderData", "_klasses")?.offset as usize;
+        let next_link_offset = self.required_struct("Klass", "_next_link")?.offset as usize;
+        let next_offset = self.required_struct("ClassLoaderData", "_next")?.offset as usize;
+        let name_offset = self.required_struct("Klass", "_name")?.offset as usize;
+        let length_offset = self.required_struct("Symbol", "_length")?.offset as usize;
+        let body_offset = self.required_struct("Symbol", "_body")?.offset as usize;
+        let mut loaders = HashSet::new();
+        let mut classes = HashSet::new();
 
         while cld != 0 {
-            let mut klass = self.read_pointer_raw(cld + klasses_offset);
+            visit_node(&mut loaders, cld)?;
+            let mut klass = self.read_pointer_at(cld, klasses_offset)?;
             while klass != 0 {
-                let name = self.get_class_name(klass);
+                visit_node(&mut classes, klass)?;
+                let name = self.get_class_name(klass, name_offset, length_offset, body_offset)?;
                 if !name.is_empty() {
                     result.push(name);
                 }
-                klass = self.read_pointer_raw(klass + next_link_offset);
+                klass = self.read_pointer_at(klass, next_link_offset)?;
             }
-            cld = self.read_pointer_raw(cld + next_offset);
+            cld = self.read_pointer_at(cld, next_offset)?;
         }
-        result
+        Ok(result)
     }
 
-    fn get_class_name(&self, klass: usize) -> String {
-        let name_offset = self.get_struct_offset("Klass", "_name");
-        if name_offset == 0 {
-            return String::new();
-        }
-        let symbol = self.read_pointer_raw(klass + name_offset);
+    fn get_class_name(
+        &self,
+        klass: usize,
+        name_offset: usize,
+        length_offset: usize,
+        body_offset: usize,
+    ) -> Result<String, String> {
+        let symbol = self.read_pointer_at(klass, name_offset)?;
         if symbol == 0 {
-            return String::new();
+            return Err("JVM class has no name; class scan incomplete.".into());
         }
-        let length = self.read_u16(symbol + 4);
-        if length == 0 || length > 500 {
-            return String::new();
+        let length_addr = symbol
+            .checked_add(length_offset)
+            .ok_or("JVM symbol address overflow")?;
+        let body_addr = symbol
+            .checked_add(body_offset)
+            .ok_or("JVM symbol address overflow")?;
+        let mut length_bytes = [0u8; 2];
+        if !self.read_bytes(length_addr, &mut length_bytes) {
+            return Err("Could not read JVM class-name length; class scan incomplete.".into());
+        }
+        let length = u16::from_le_bytes(length_bytes);
+        if length == 0 {
+            return Err("JVM class has an empty name; class scan incomplete.".into());
         }
         let mut buf = vec![0u8; length as usize];
-        if !self.read_bytes(symbol + 6, &mut buf) {
-            return String::new();
+        if !self.read_bytes(body_addr, &mut buf) {
+            return Err("Could not read JVM class name; class scan incomplete.".into());
         }
         // Doomsday встраивает в имена классов непечатные/не-ASCII байты, чтобы
         // ломать детекторы и читаемость дампа. Выбрасываем их здесь, чтобы имя
@@ -382,10 +508,16 @@ impl JvmContext {
             .chars()
             .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != ' ')
             .collect();
-        if clean.is_empty() {
-            String::new()
-        } else {
-            clean
-        }
+        Ok(clean)
     }
+}
+
+fn visit_node(visited: &mut HashSet<usize>, address: usize) -> Result<(), String> {
+    if !visited.insert(address) {
+        return Err("Cycle in JVM class graph; class scan incomplete.".into());
+    }
+    if visited.len() > 1_000_000 {
+        return Err("JVM class graph exceeds traversal limit; class scan incomplete.".into());
+    }
+    Ok(())
 }

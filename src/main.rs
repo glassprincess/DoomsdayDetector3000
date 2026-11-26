@@ -57,6 +57,7 @@ fn run_scan(db: Option<&SignatureDatabase>) {
 
 fn print_credits() {
     ui::begin_screen("Credits", None);
+    ui::info(concat!("Version ", env!("CARGO_PKG_VERSION")));
     println!("  DDD — Doomsday Detector. Отдельная проверка под Doomsday.");
     println!("  Собран на коде и интерфейсе Jrss. Written and maintained by Lain.");
     println!();

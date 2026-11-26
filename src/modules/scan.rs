@@ -13,7 +13,7 @@ pub fn run(db: &SignatureDatabase) {
         ui::progress_bar("Сканирование", p.bytes_scanned, p.total_estimate);
     }) {
         Ok(result) => ui::render_scan_result(&result),
-        Err(e) => ui::error(&format!("Could not open process. Run the scanner as administrator. ({e})")),
+        Err(e) => ui::error(&format!("Memory scan failed or could not be completed. ({e})")),
     }
 
     class_dumper::check(pid);

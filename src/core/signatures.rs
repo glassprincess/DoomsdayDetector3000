@@ -18,6 +18,37 @@ pub enum Severity {
     Confirmed,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_databases_without_usable_patterns() {
+        for patterns in ["[]", "[\"\"]"] {
+            let json = format!(
+                r#"[{{"Family":"Doomsday","Severity":"Confirmed","Patterns":{patterns}}}]"#
+            );
+            assert!(SignatureDatabase::load_from_str(&json).is_err());
+        }
+    }
+
+    #[test]
+    fn matches_utf8_and_utf16_patterns() {
+        let db = SignatureDatabase::load_from_str(
+            r#"[{"Family":"Doomsday","Severity":"Confirmed","Patterns":["marker"]}]"#,
+        )
+        .unwrap();
+        for bytes in [
+            b"marker".to_vec(),
+            "marker".encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ] {
+            let mut hits = Vec::new();
+            db.scan_buffer(&bytes, |tag| hits.push(tag.family.clone()));
+            assert_eq!(hits, ["Doomsday"]);
+        }
+    }
+}
+
 impl Severity {
     pub fn label(self) -> &'static str {
         match self {
@@ -76,7 +107,10 @@ impl SignatureDatabase {
                     continue;
                 }
                 pattern_count += 1;
-                let tag = DetectionTag { family: fam.family.clone(), severity: fam.severity };
+                let tag = DetectionTag {
+                    family: fam.family.clone(),
+                    severity: fam.severity,
+                };
 
                 if seen.insert((fam.family.clone(), p.clone(), false)) {
                     let bytes = p.as_bytes().to_vec();
@@ -91,6 +125,10 @@ impl SignatureDatabase {
                     tags.push(tag);
                 }
             }
+        }
+
+        if patterns.is_empty() {
+            return Err("Signature database has no usable patterns.".to_string());
         }
 
         let automaton = AhoCorasickBuilder::new()

@@ -23,12 +23,20 @@ fn collect(pid: u32) -> Result<Vec<String>, String> {
     let mut ctx = JvmContext::open(pid)
         .map_err(|e| format!("Could not open process. Run the scanner as administrator. ({e})"))?;
 
-    let ready = ui::with_spinner("Разбираем PE-таблицы jvm.dll и VMStructs...", || ctx.initialize());
+    let ready = ui::with_spinner(
+        "Разбираем PE-таблицы jvm.dll и VMStructs...",
+        || ctx.initialize(),
+    );
     if !ready {
-        return Err("Failed to initialize JVM context. Make sure the process is a Java/javaw process.".to_string());
+        return Err(
+            "Failed to initialize JVM context. Make sure the process is a Java/javaw process."
+                .to_string(),
+        );
     }
 
-    let classes = ui::with_spinner("Обходим ClassLoaderDataGraph...", || ctx.enumerate_all_class_names());
+    let classes = ui::with_spinner("Обходим ClassLoaderDataGraph...", || {
+        ctx.enumerate_all_class_names()
+    })?;
     if classes.is_empty() {
         return Err("No classes found. The JVM may not have loaded any classes yet.".to_string());
     }
@@ -45,33 +53,36 @@ fn report_doomsday_findings(classes: &[String]) {
     }
 
     if !findings.blatant.is_empty() {
-        ui::alert_flash(&format!("  ✕ ●  BLATANT: {} классов с явно случайными lowercase+digit именами", findings.blatant.len()), ui::Color::Red);
+        ui::warn(&format!(
+            "BLATANT: {} классов с подозрительными lowercase+digit именами",
+            findings.blatant.len()
+        ));
         for name in findings.blatant.iter().take(SAMPLE_LIMIT) {
             println!("    ▸ {name}");
         }
     }
 
     if !findings.normal.is_empty() {
-        ui::alert_flash(&format!("  ✕ ●  NORMAL: {} классов с рандомным коротким «пакетом» + хаотичным именем (Doomsday)", findings.normal.len()), ui::Color::Red);
+        ui::warn(&format!(
+            "NORMAL: {} классов с коротким «пакетом» и хаотичным именем",
+            findings.normal.len()
+        ));
         for name in findings.normal.iter().take(SAMPLE_LIMIT) {
             println!("    ▸ {name}");
         }
     }
 
     if findings.vanilla_flagged() {
-        ui::alert_flash(
-            &format!(
-                "  ✕ ●  VANILLA-МАСКИРОВКА: {} из первых {} классов — короткие ванильные имена",
-                findings.vanilla_total_in_window, findings.vanilla_window
-            ),
-            ui::Color::Red,
-        );
+        ui::warn(&format!(
+            "VANILLA: {} из первых {} классов имеют короткие обфусцированные имена",
+            findings.vanilla_total_in_window, findings.vanilla_window
+        ));
         for name in &findings.vanilla_sample {
             println!("    ▸ {name}");
         }
     }
 
-    ui::write_line("  ●  КРАСНЫЙ — имена классов совпали с паттернами Doomsday", ui::Color::Red);
+    ui::warn("ЖЁЛТЫЙ: имена похожи на паттерны Doomsday. Эвристика не подтверждает наличие чита.");
 }
 
 const SAMPLE_LIMIT: usize = 10;
